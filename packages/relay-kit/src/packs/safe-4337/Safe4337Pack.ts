@@ -1,4 +1,4 @@
-import { getAddress, toHex } from 'viem'
+import { getAddress, toHex, isHex } from 'viem'
 import semverSatisfies from 'semver/functions/satisfies.js'
 import Safe, {
   EthSafeSignature,
@@ -7,8 +7,9 @@ import Safe, {
   PasskeyClient,
   SafeProvider,
   generateOnChainIdentifier,
-  predictSafeAddress
+  SafeAccountConfig
 } from '@wdk-safe-global/protocol-kit'
+import { SafeVersion } from '@safe-global/types-kit'
 import { RelayKitBasePack } from '@wdk-safe-global/relay-kit/RelayKitBasePack'
 import {
   OperationType,
@@ -22,7 +23,23 @@ import {
   getSafe4337ModuleDeployment,
   getSafeWebAuthnShareSignerDeployment
 } from '@safe-global/safe-modules-deployments'
-import { Hash, encodeFunctionData, zeroAddress, Hex, concat } from 'viem'
+import {
+  getSafeL2SingletonDeployment,
+  getProxyFactoryDeployment,
+  getMultiSendDeployment
+} from '@safe-global/safe-deployments'
+import {
+  Hash,
+  encodeFunctionData,
+  zeroAddress,
+  Hex,
+  concat,
+  keccak256,
+  slice,
+  encodeAbiParameters,
+  parseAbiParameters,
+  pad
+} from 'viem'
 import BaseSafeOperation from '@wdk-safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
 import SafeOperationFactory from '@wdk-safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
 import {
@@ -52,12 +69,237 @@ import {
 } from '@wdk-safe-global/relay-kit/packs/safe-4337/utils'
 import { PimlicoFeeEstimator } from '@wdk-safe-global/relay-kit/packs/safe-4337/estimators/pimlico/PimlicoFeeEstimator'
 
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const EMPTY_DATA = '0x'
+
+function asHex(hex?: string): Hex {
+  return isHex(hex) ? (hex as Hex) : (`0x${hex}` as Hex)
+}
+
 const MAX_ERC20_AMOUNT_TO_APPROVE =
   0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn
 
 const EQ_OR_GT_1_4_1 = '>=1.4.1'
 
-const USDT_ON_MAINNET = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+const SAFE_PROXY_CREATION_CODES = {
+  latest:
+    '0x608060405234801561001057600080fd5b506040516101e63803806101e68339818101604052602081101561003357600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100ca576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260228152602001806101c46022913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505060ab806101196000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea264697066735822122003d1488ee65e08fa41e58e888a9865554c535f2c77126a82cb4c0f917f31441364736f6c63430007060033496e76616c69642073696e676c65746f6e20616464726573732070726f7669646564',
+  zkSync: {
+    latest:
+      '0x0000000000000000000000000000000000000000000000000000000000000000000000000100003b6cfa15bd7d1cae1c9c022074524d7785d34859ad0576d8fab4305d4f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+  }
+} as const
+
+const ZKSYNC_CREATE2_PREFIX = '0x2020dba91b30cc0006188af794c2fb30dd8520db7e2c088b7fc7c103c00ca494'
+const ZKSYNC_SAFE_PROXY_DEPLOYED_BYTECODE: { [version: string]: { deployedBytecodeHash: Hash } } = {
+  '1.3.0': {
+    deployedBytecodeHash: '0x0100004124426fb9ebb25e27d670c068e52f9ba631bd383279a188be47e3f86d'
+  },
+  '1.4.1': {
+    deployedBytecodeHash: '0x0100003b6cfa15bd7d1cae1c9c022074524d7785d34859ad0576d8fab4305d4f'
+  }
+}
+
+function zkSyncCreate2Address(from: string, safeVersion: string, salt: Hex, input: Hex): string {
+  const bytecodeHash = ZKSYNC_SAFE_PROXY_DEPLOYED_BYTECODE[safeVersion]?.deployedBytecodeHash
+  if (!bytecodeHash) throw new Error(`Unsupported Safe version for zkSync: ${safeVersion}`)
+  const inputHash = keccak256(input)
+  const addressBytes = keccak256(
+    concat([ZKSYNC_CREATE2_PREFIX, pad(asHex(from)), salt, bytecodeHash, inputHash])
+  ).slice(26)
+  return `0x${addressBytes}`
+}
+
+/**
+ * Gets the Safe deployment information (version, factory, singleton).
+ * This helper function gets the Safe core version and contract addresses
+ * based on the chain ID and Safe version.
+ *
+ * @param {bigint | number} chainId - The chain ID
+ * @param {string} safeVersion - The Safe core version to use
+ * @returns {Object} Object containing safeVersion, factoryAddress, and singletonAddress
+ * @throws {Error} If no deployment information is found for the chain ID and version
+ */
+function getSafeDeploymentInfo(
+  chainId: bigint | number,
+  safeVersion: string
+): {
+  safeVersion: string
+  factoryAddress: string
+  singletonAddress: string
+} {
+  const singletonDeployment = getSafeL2SingletonDeployment({
+    version: safeVersion as SafeVersion,
+    released: true
+  })
+
+  const factoryDeployment = getProxyFactoryDeployment({
+    version: safeVersion as SafeVersion,
+    released: true
+  })
+
+  if (!singletonDeployment) {
+    throw new Error(`No Safe singleton deployment found for version ${safeVersion}`)
+  }
+
+  if (!factoryDeployment) {
+    throw new Error(`No Safe proxy factory deployment found for version ${safeVersion}`)
+  }
+
+  const chainIdStr = chainId.toString()
+  const singletonAddress = singletonDeployment.networkAddresses[chainIdStr]
+  const factoryAddress = factoryDeployment.networkAddresses[chainIdStr]
+
+  if (!singletonAddress) {
+    throw new Error(
+      `No Safe singleton address found for chain ID ${chainId} and version ${safeVersion}`
+    )
+  }
+
+  if (!factoryAddress) {
+    throw new Error(
+      `No Safe proxy factory address found for chain ID ${chainId} and version ${safeVersion}`
+    )
+  }
+
+  return {
+    safeVersion,
+    factoryAddress,
+    singletonAddress
+  }
+}
+
+/**
+ * Detects if a chain is zkSync.
+ *
+ * @param {bigint | number} chainId - The chain ID to check.
+ * @returns {boolean} True if the provided chain is a zkSync network; otherwise false.
+ */
+function isZkSyncChain(chainId: bigint | number): boolean {
+  const ZKSYNC_CHAIN_IDS = new Set([
+    324, // zkSync Era mainnet
+    300, // zkSync Era testnet
+    280, // zkSync Era localnet
+    232 // zkSync Era internal testnet
+  ])
+  return ZKSYNC_CHAIN_IDS.has(Number(chainId))
+}
+
+/**
+ * Returns the Safe Proxy creation bytecode for the provided Safe version on EVM chains.
+ *
+ * - Versions 1.0.0 - 1.2.0 use the legacy bytecode.
+ * - Versions 1.3.0+ use the latest bytecode.
+ * - zkSync chains are not supported by this function (different CREATE2 mechanics).
+ *
+ * @param {string} safeVersion - The Safe core version used to select the bytecode.
+ * @param {bigint | number} [chainId] - Optional chain ID; if a zkSync chain is detected, an error is thrown.
+ * @returns {`0x${string}`} The proxy creation bytecode for the given Safe version.
+ * @throws {Error} If called for a zkSync chain.
+ */
+function getProxyCreationCode(chainId?: bigint | number): `0x${string}` {
+  if (chainId && isZkSyncChain(chainId)) {
+    return SAFE_PROXY_CREATION_CODES.zkSync.latest
+  }
+  return SAFE_PROXY_CREATION_CODES.latest
+}
+
+/**
+ * Encodes the Safe setup initializer data synchronously.
+ *
+ * Produces the exact calldata used by Safe deployment, matching version-specific ABIs:
+ * - Safe 1.0.0: setup(address[] _owners, uint256 _threshold, address to, bytes data, address paymentToken, uint256 payment, address paymentReceiver)
+ * - Safe 1.1.0+: setup(address[] _owners, uint256 _threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)
+ *
+ * @param {SafeAccountConfig} safeAccountConfig - The configuration used for the Safe setup transaction.
+ * @param {string} safeVersion - The Safe core version used to select the correct ABI.
+ * @returns {string} Hex-encoded calldata for the Safe setup function.
+ */
+function encodeSetupCallDataSync(
+  safeAccountConfig: SafeAccountConfig,
+  safeVersion: string
+): string {
+  const {
+    owners,
+    threshold,
+    to = ZERO_ADDRESS,
+    data = EMPTY_DATA,
+    fallbackHandler = ZERO_ADDRESS,
+    paymentToken = ZERO_ADDRESS,
+    payment = 0,
+    paymentReceiver = ZERO_ADDRESS
+  } = safeAccountConfig
+
+  const version = safeVersion.split('.')
+  const major = parseInt(version[0])
+  const minor = parseInt(version[1])
+
+  if (major === 1 && minor === 0) {
+    const setupData = encodeFunctionData({
+      abi: [
+        {
+          inputs: [
+            { name: '_owners', type: 'address[]' },
+            { name: '_threshold', type: 'uint256' },
+            { name: 'to', type: 'address' },
+            { name: 'data', type: 'bytes' },
+            { name: 'paymentToken', type: 'address' },
+            { name: 'payment', type: 'uint256' },
+            { name: 'paymentReceiver', type: 'address' }
+          ],
+          name: 'setup',
+          outputs: [],
+          stateMutability: 'nonpayable',
+          type: 'function'
+        }
+      ],
+      functionName: 'setup',
+      args: [
+        owners,
+        BigInt(threshold),
+        to as `0x${string}`,
+        data as `0x${string}`,
+        paymentToken as `0x${string}`,
+        BigInt(payment),
+        paymentReceiver as `0x${string}`
+      ]
+    })
+    return setupData
+  } else {
+    const setupData = encodeFunctionData({
+      abi: [
+        {
+          inputs: [
+            { name: '_owners', type: 'address[]' },
+            { name: '_threshold', type: 'uint256' },
+            { name: 'to', type: 'address' },
+            { name: 'data', type: 'bytes' },
+            { name: 'fallbackHandler', type: 'address' },
+            { name: 'paymentToken', type: 'address' },
+            { name: 'payment', type: 'uint256' },
+            { name: 'paymentReceiver', type: 'address' }
+          ],
+          name: 'setup',
+          outputs: [],
+          stateMutability: 'nonpayable',
+          type: 'function'
+        }
+      ],
+      functionName: 'setup',
+      args: [
+        owners,
+        BigInt(threshold),
+        to as `0x${string}`,
+        data as `0x${string}`,
+        fallbackHandler as `0x${string}`,
+        paymentToken as `0x${string}`,
+        BigInt(payment),
+        paymentReceiver as `0x${string}`
+      ]
+    })
+    return setupData
+  }
+}
 
 /**
  * Safe4337Pack class that extends RelayKitBasePack.
@@ -242,10 +484,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
       const setupTransactions = [enable4337ModuleTransaction]
 
-      // Initialize deployment variables early
-      let deploymentTo = enable4337ModuleTransaction.to
-      let deploymentData = enable4337ModuleTransaction.data
-
       const isApproveTransactionRequired =
         !!paymasterOptions &&
         !paymasterOptions.isSponsored &&
@@ -253,59 +491,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
       if (isApproveTransactionRequired && !paymasterOptions.skipApproveTransaction) {
         const { paymasterAddress, amountToApprove = MAX_ERC20_AMOUNT_TO_APPROVE } = paymasterOptions
-
-        // Handle USDT on Mainnet special case - must reset allowance to 0 first if current allowance != 0
-        if (
-          paymasterOptions.paymasterTokenAddress.toLowerCase() === USDT_ON_MAINNET.toLowerCase()
-        ) {
-          // Get the predicted Safe address to check current allowance
-          const predictedSafeAddress = await predictSafeAddress({
-            safeProvider: await SafeProvider.init({ provider, signer, safeVersion }),
-            chainId: BigInt(chainId),
-            safeAccountConfig: {
-              owners: options.owners,
-              threshold: options.threshold,
-              to: deploymentTo,
-              data: deploymentData,
-              fallbackHandler: safe4337ModuleAddress,
-              paymentToken: zeroAddress,
-              payment: 0,
-              paymentReceiver: zeroAddress
-            },
-            safeDeploymentConfig: {
-              safeVersion,
-              saltNonce: options.saltNonce || undefined,
-              deploymentType: options.deploymentType || undefined
-            }
-          })
-
-          // Create a SafeProvider to read contract data
-          const tempSafeProvider = await SafeProvider.init({ provider, signer, safeVersion })
-
-          // Check current allowance to paymaster using SafeProvider's readContract
-          const currentAllowance = await tempSafeProvider.readContract({
-            address: paymasterOptions.paymasterTokenAddress as `0x${string}`,
-            abi: ABI,
-            functionName: 'allowance',
-            args: [predictedSafeAddress as `0x${string}`, paymasterAddress]
-          })
-
-          // Only reset if current allowance is not 0
-          if (currentAllowance !== 0n) {
-            const resetApproveToPaymasterTransaction = {
-              to: paymasterOptions.paymasterTokenAddress,
-              data: encodeFunctionData({
-                abi: ABI,
-                functionName: 'approve',
-                args: [paymasterAddress, 0n]
-              }),
-              value: '0',
-              operation: OperationType.Call // Call for approve
-            }
-
-            setupTransactions.push(resetApproveToPaymasterTransaction)
-          }
-        }
 
         // second transaction: approve ERC-20 paymaster token
         const approveToPaymasterTransaction = {
@@ -362,6 +547,9 @@ export class Safe4337Pack extends RelayKitBasePack<{
         setupTransactions.push(sharedSignerTransaction)
       }
 
+      let deploymentTo
+      let deploymentData
+
       const isBatch = setupTransactions.length > 1
 
       if (isBatch) {
@@ -379,6 +567,9 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
         deploymentTo = multiSendContract.getAddress()
         deploymentData = batchData
+      } else {
+        deploymentTo = enable4337ModuleTransaction.to
+        deploymentData = enable4337ModuleTransaction.data
       }
 
       protocolKit = await Safe.init({
@@ -892,5 +1083,178 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
   getOnchainIdentifier(): string {
     return this.#onchainIdentifier
+  }
+
+  /**
+   * Predicts the address of a Safe account and returns it.
+   *
+   * Implements the CREATE2 derivation using the Safe Proxy Factory:
+   * address = keccak256(0xff ++ factoryAddress ++ salt ++ keccak256(initCode))[12:]
+   *
+   * @param {Object} config - The prediction configuration.
+   * @param {number} config.threshold - The number of owners required to execute a transaction.
+   * @param {string[]} config.owners - The owner addresses for the Safe account.
+   * @param {string} config.saltNonce - 0x-prefixed 32-byte salt used for CREATE2.
+   * @param {bigint | number} config.chainId - The chain ID for deployment.
+   * @param {string} [config.safeVersion='1.4.1'] - The Safe core contract version.
+   * @param {string} [config.safeModulesVersion='0.2.0'] - The Safe modules version.
+   * @param {PaymasterOptions} [config.paymasterOptions] - Paymaster configuration.
+   * @returns {string} The predicted Safe address (checksumed hex string).
+   */
+  static predictSafeAddress({
+    threshold,
+    owners,
+    saltNonce,
+    chainId,
+    safeVersion = '1.4.1',
+    safeModulesVersion = '0.2.0',
+    paymasterOptions
+  }: {
+    threshold: number
+    owners: string[]
+    saltNonce: string
+    chainId: bigint | number
+    safeVersion?: string
+    safeModulesVersion?: string
+    paymasterOptions?: PaymasterOptions
+  }): string {
+    if (owners.length <= 0) {
+      throw new Error('Owner list must have at least one owner')
+    }
+    if (threshold <= 0) {
+      throw new Error('Threshold must be greater than or equal to 1')
+    }
+    if (threshold > owners.length) {
+      throw new Error('Threshold must be lower than or equal to owners length')
+    }
+
+    const chainIdBigInt = BigInt(chainId)
+
+    const { factoryAddress, singletonAddress } = getSafeDeploymentInfo(chainIdBigInt, safeVersion)
+
+    const network = chainIdBigInt.toString()
+    const safe4337ModuleDeployment = getSafe4337ModuleDeployment({
+      released: true,
+      version: safeModulesVersion,
+      network
+    })
+    const safe4337ModuleAddress = safe4337ModuleDeployment?.networkAddresses[network]
+
+    if (!safe4337ModuleAddress) {
+      throw new Error(
+        `Safe4337Module not available for chain ${network} and modules version ${safeModulesVersion}`
+      )
+    }
+
+    const safeModuleSetupDeployment = getSafeModuleSetupDeployment({
+      released: true,
+      version: safeModulesVersion,
+      network
+    })
+    const safeModulesSetupAddress = safeModuleSetupDeployment?.networkAddresses[network]
+
+    if (!safeModulesSetupAddress) {
+      throw new Error(
+        `SafeModuleSetup not available for chain ${network} and modules version ${safeModulesVersion}`
+      )
+    }
+
+    const enable4337ModuleTransaction = {
+      to: safeModulesSetupAddress,
+      value: '0',
+      data: encodeFunctionData({
+        abi: ABI,
+        functionName: 'enableModules',
+        args: [[safe4337ModuleAddress]]
+      }),
+      operation: OperationType.DelegateCall
+    }
+
+    const setupTransactions = [enable4337ModuleTransaction]
+
+    const isApproveTransactionRequired =
+      !!paymasterOptions &&
+      !paymasterOptions.isSponsored &&
+      !!paymasterOptions.paymasterTokenAddress
+
+    if (isApproveTransactionRequired) {
+      const { paymasterAddress, amountToApprove = MAX_ERC20_AMOUNT_TO_APPROVE } = paymasterOptions
+
+      const approveToPaymasterTransaction = {
+        to: paymasterOptions.paymasterTokenAddress,
+        data: encodeFunctionData({
+          abi: ABI,
+          functionName: 'approve',
+          args: [paymasterAddress, amountToApprove]
+        }),
+        value: '0',
+        operation: OperationType.Call
+      }
+
+      setupTransactions.push(approveToPaymasterTransaction)
+    }
+
+    let deploymentTo: string
+    let deploymentData: string
+
+    const isBatch = setupTransactions.length > 1
+
+    if (isBatch) {
+      const multiSendDeployment = getMultiSendDeployment({
+        version: safeVersion as SafeVersion,
+        released: true
+      })
+      const multiSendAddress = multiSendDeployment?.networkAddresses[network]
+
+      if (!multiSendAddress) {
+        throw new Error(`MultiSend not available for chain ${network} and version ${safeVersion}`)
+      }
+
+      deploymentTo = multiSendAddress
+      deploymentData = encodeFunctionData({
+        abi: ABI,
+        functionName: 'multiSend',
+        args: [encodeMultiSendData(setupTransactions) as Hex]
+      })
+    } else {
+      deploymentTo = enable4337ModuleTransaction.to
+      deploymentData = enable4337ModuleTransaction.data
+    }
+
+    const safeAccountConfig: SafeAccountConfig = {
+      owners,
+      threshold,
+      to: deploymentTo,
+      data: deploymentData,
+      fallbackHandler: safe4337ModuleAddress,
+      paymentToken: '0x0000000000000000000000000000000000000000',
+      payment: 0,
+      paymentReceiver: '0x0000000000000000000000000000000000000000'
+    }
+
+    const initializer = encodeSetupCallDataSync(safeAccountConfig, safeVersion)
+
+    const initializerHash = keccak256(initializer as `0x${string}`)
+
+    const encodedNonce = encodeAbiParameters(parseAbiParameters('uint256'), [BigInt(saltNonce)])
+    const salt = keccak256(concat([initializerHash as `0x${string}`, encodedNonce]))
+
+    const proxyCreationCode = getProxyCreationCode(chainIdBigInt)
+
+    const checksummedSingletonAddress = getAddress(singletonAddress)
+    const input = encodeAbiParameters(parseAbiParameters('address'), [checksummedSingletonAddress])
+
+    if (isZkSyncChain(chainId)) {
+      const proxyAddress = zkSyncCreate2Address(factoryAddress, safeVersion, salt, asHex(input))
+      return getAddress(proxyAddress)
+    }
+    const initCode = concat([proxyCreationCode, asHex(input)])
+
+    const hash = keccak256(
+      concat(['0xff' as `0x${string}`, factoryAddress as `0x${string}`, salt, keccak256(initCode)])
+    )
+
+    const address = slice(hash, 12)
+    return getAddress(address)
   }
 }
