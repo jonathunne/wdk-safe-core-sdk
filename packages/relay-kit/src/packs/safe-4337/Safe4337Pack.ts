@@ -21,9 +21,25 @@ import {
   getSafe4337ModuleDeployment,
   getSafeWebAuthnShareSignerDeployment
 } from '@safe-global/safe-modules-deployments'
-import { Hash, encodeFunctionData, zeroAddress, Hex, concat } from 'viem'
-import BaseSafeOperation from '@safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
-import SafeOperationFactory from '@safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
+import {
+  getSafeL2SingletonDeployment,
+  getProxyFactoryDeployment,
+  getMultiSendDeployment
+} from '@safe-global/safe-deployments'
+import {
+  Hash,
+  encodeFunctionData,
+  zeroAddress,
+  Hex,
+  concat,
+  keccak256,
+  slice,
+  encodeAbiParameters,
+  parseAbiParameters,
+  pad
+} from 'viem'
+import BaseSafeOperation from '@wdk-safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
+import SafeOperationFactory from '@wdk-safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
 import {
   EstimateFeeProps,
   Safe4337CreateTransactionProps,
@@ -718,5 +734,177 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
   getOnchainIdentifier(): string {
     return this.#onchainIdentifier
+  }
+
+  /**
+   * Predicts the address of a Safe account and returns it.
+   *
+   * Implements the CREATE2 derivation using the Safe Proxy Factory:
+   * address = keccak256(0xff ++ factoryAddress ++ salt ++ keccak256(initCode))[12:]
+   *
+   * @param {Object} config - The prediction configuration.
+   * @param {number} config.threshold - The number of owners required to execute a transaction.
+   * @param {string[]} config.owners - The owner addresses for the Safe account.
+   * @param {string} config.saltNonce - 0x-prefixed 32-byte salt used for CREATE2.
+   * @param {string} config.entryPointAddress - The ERC-4337 entrypoint address.
+   * @param {bigint | number} config.chainId - The chain ID for deployment.
+   * @returns {string} The predicted Safe address (checksumed hex string).
+   */
+  static predictSafeAddress({
+    threshold,
+    owners,
+    saltNonce,
+    chainId,
+    safeVersion = '1.4.1',
+    safeModulesVersion = '0.2.0',
+    paymasterOptions
+  }: {
+    threshold: number
+    owners: string[]
+    saltNonce: string
+    chainId: bigint | number
+    safeVersion?: string
+    safeModulesVersion?: string
+    paymasterOptions?: PaymasterOptions
+  }): string {
+    // Validate owners and threshold
+    if (owners.length <= 0) {
+      throw new Error('Owner list must have at least one owner')
+    }
+    if (threshold <= 0) {
+      throw new Error('Threshold must be greater than or equal to 1')
+    }
+    if (threshold > owners.length) {
+      throw new Error('Threshold must be lower than or equal to owners length')
+    }
+
+    const chainIdBigInt = BigInt(chainId)
+
+    const { factoryAddress, singletonAddress } = getSafeDeploymentInfo(chainIdBigInt, safeVersion)
+
+    const network = chainIdBigInt.toString()
+    const safe4337ModuleDeployment = getSafe4337ModuleDeployment({
+      released: true,
+      version: safeModulesVersion,
+      network
+    })
+    const safe4337ModuleAddress = safe4337ModuleDeployment?.networkAddresses[network]
+
+    if (!safe4337ModuleAddress) {
+      throw new Error(
+        `Safe4337Module not available for chain ${network} and modules version ${safeModulesVersion}`
+      )
+    }
+
+    const safeModuleSetupDeployment = getSafeModuleSetupDeployment({
+      released: true,
+      version: safeModulesVersion,
+      network
+    })
+    const safeModulesSetupAddress = safeModuleSetupDeployment?.networkAddresses[network]
+
+    if (!safeModulesSetupAddress) {
+      throw new Error(
+        `SafeModuleSetup not available for chain ${network} and modules version ${safeModulesVersion}`
+      )
+    }
+
+    const enable4337ModuleTransaction = {
+      to: safeModulesSetupAddress,
+      value: '0',
+      data: encodeFunctionData({
+        abi: ABI,
+        functionName: 'enableModules',
+        args: [[safe4337ModuleAddress]]
+      }),
+      operation: OperationType.DelegateCall
+    }
+
+    const setupTransactions = [enable4337ModuleTransaction]
+
+    const isApproveTransactionRequired =
+      !!paymasterOptions &&
+      !paymasterOptions.isSponsored &&
+      !!paymasterOptions.paymasterTokenAddress
+
+    if (isApproveTransactionRequired) {
+      const { paymasterAddress, amountToApprove = MAX_ERC20_AMOUNT_TO_APPROVE } = paymasterOptions
+
+      const approveToPaymasterTransaction = {
+        to: paymasterOptions.paymasterTokenAddress,
+        data: encodeFunctionData({
+          abi: ABI,
+          functionName: 'approve',
+          args: [paymasterAddress, amountToApprove]
+        }),
+        value: '0',
+        operation: OperationType.Call
+      }
+
+      setupTransactions.push(approveToPaymasterTransaction)
+    }
+
+    let deploymentTo: string
+    let deploymentData: string
+
+    const isBatch = setupTransactions.length > 1
+
+    if (isBatch) {
+      const multiSendDeployment = getMultiSendDeployment({
+        version: safeVersion as SafeVersion,
+        released: true
+      })
+      const multiSendAddress = multiSendDeployment?.networkAddresses[network]
+
+      if (!multiSendAddress) {
+        throw new Error(`MultiSend not available for chain ${network} and version ${safeVersion}`)
+      }
+
+      deploymentTo = multiSendAddress
+      deploymentData = encodeFunctionData({
+        abi: ABI,
+        functionName: 'multiSend',
+        args: [encodeMultiSendData(setupTransactions) as Hex]
+      })
+    } else {
+      deploymentTo = enable4337ModuleTransaction.to
+      deploymentData = enable4337ModuleTransaction.data
+    }
+
+    const safeAccountConfig: SafeAccountConfig = {
+      owners,
+      threshold,
+      to: deploymentTo,
+      data: deploymentData,
+      fallbackHandler: safe4337ModuleAddress,
+      paymentToken: '0x0000000000000000000000000000000000000000',
+      payment: 0,
+      paymentReceiver: '0x0000000000000000000000000000000000000000'
+    }
+
+    const initializer = encodeSetupCallDataSync(safeAccountConfig, safeVersion)
+
+    const initializerHash = keccak256(initializer as `0x${string}`)
+
+    const encodedNonce = encodeAbiParameters(parseAbiParameters('uint256'), [BigInt(saltNonce)])
+    const salt = keccak256(concat([initializerHash as `0x${string}`, encodedNonce]))
+
+    const proxyCreationCode = getProxyCreationCode(chainIdBigInt)
+
+    const checksummedSingletonAddress = getAddress(singletonAddress)
+    const input = encodeAbiParameters(parseAbiParameters('address'), [checksummedSingletonAddress])
+
+    if (isZkSyncChain(chainId)) {
+      const proxyAddress = zkSyncCreate2Address(factoryAddress, safeVersion, salt, asHex(input))
+      return getAddress(proxyAddress)
+    }
+    const initCode = concat([proxyCreationCode, asHex(input)])
+
+    const hash = keccak256(
+      concat(['0xff' as `0x${string}`, factoryAddress as `0x${string}`, salt, keccak256(initCode)])
+    )
+
+    const address = slice(hash, 12)
+    return getAddress(address)
   }
 }
