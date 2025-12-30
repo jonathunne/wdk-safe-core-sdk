@@ -25,7 +25,8 @@ import {
 } from '@safe-global/safe-modules-deployments'
 import {
   getSafeL2SingletonDeployment,
-  getProxyFactoryDeployment
+  getProxyFactoryDeployment,
+  getMultiSendDeployment
 } from '@safe-global/safe-deployments'
 import {
   Hash,
@@ -1103,15 +1104,17 @@ export class Safe4337Pack extends RelayKitBasePack<{
     owners,
     saltNonce,
     chainId,
-    safeVersion,
-    safeModulesVersion
+    safeVersion = '1.4.1',
+    safeModulesVersion = '0.2.0',
+    paymasterOptions
   }: {
     threshold: number
     owners: string[]
     saltNonce: string
     chainId: bigint | number
-    safeVersion: string
-    safeModulesVersion: string
+    safeVersion?: string
+    safeModulesVersion?: string
+    paymasterOptions?: PaymasterOptions
   }): string {
     // Validate owners and threshold
     if (owners.length <= 0) {
@@ -1166,8 +1169,56 @@ export class Safe4337Pack extends RelayKitBasePack<{
       operation: OperationType.DelegateCall
     }
 
-    const deploymentTo = enable4337ModuleTransaction.to
-    const deploymentData = enable4337ModuleTransaction.data
+    const setupTransactions = [enable4337ModuleTransaction]
+
+    const isApproveTransactionRequired =
+      !!paymasterOptions &&
+      !paymasterOptions.isSponsored &&
+      !!paymasterOptions.paymasterTokenAddress
+
+    if (isApproveTransactionRequired) {
+      const { paymasterAddress, amountToApprove = MAX_ERC20_AMOUNT_TO_APPROVE } = paymasterOptions
+
+      const approveToPaymasterTransaction = {
+        to: paymasterOptions.paymasterTokenAddress,
+        data: encodeFunctionData({
+          abi: ABI,
+          functionName: 'approve',
+          args: [paymasterAddress, amountToApprove]
+        }),
+        value: '0',
+        operation: OperationType.Call
+      }
+
+      setupTransactions.push(approveToPaymasterTransaction)
+    }
+
+    let deploymentTo: string
+    let deploymentData: string
+
+    const isBatch = setupTransactions.length > 1
+
+    if (isBatch) {
+      const multiSendDeployment = getMultiSendDeployment({
+        version: safeVersion as SafeVersion,
+        released: true
+      })
+      const multiSendAddress = multiSendDeployment?.networkAddresses[network]
+
+      if (!multiSendAddress) {
+        throw new Error(`MultiSend not available for chain ${network} and version ${safeVersion}`)
+      }
+
+      deploymentTo = multiSendAddress
+      deploymentData = encodeFunctionData({
+        abi: ABI,
+        functionName: 'multiSend',
+        args: [encodeMultiSendData(setupTransactions) as Hex]
+      })
+    } else {
+      deploymentTo = enable4337ModuleTransaction.to
+      deploymentData = enable4337ModuleTransaction.data
+    }
 
     const safeAccountConfig: SafeAccountConfig = {
       owners,
