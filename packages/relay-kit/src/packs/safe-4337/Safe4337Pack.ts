@@ -757,12 +757,37 @@ export class Safe4337Pack extends RelayKitBasePack<{
     transactions,
     options = {}
   }: Safe4337CreateTransactionProps): Promise<BaseSafeOperation> {
-    const { amountToApprove, validUntil, validAfter, feeEstimator, customNonce } = options
+    const {
+      amountToApprove,
+      validUntil,
+      validAfter,
+      feeEstimator,
+      customNonce,
+      paymasterTokenAddress,
+      isSponsored,
+      sponsorshipPolicyId
+    } = options
+
+    const paymasterOptions: PaymasterOptions = this.#paymasterOptions
+      ? { ...this.#paymasterOptions }
+      : undefined
+
+    if (paymasterOptions) {
+      if (isSponsored) {
+        // Switch to SponsoredPaymasterOption
+        ;(paymasterOptions as any).isSponsored = true
+        ;(paymasterOptions as any).sponsorshipPolicyId = sponsorshipPolicyId
+        delete (paymasterOptions as any).paymasterTokenAddress
+        delete (paymasterOptions as any).amountToApprove
+      } else if (!paymasterOptions.isSponsored && paymasterTokenAddress) {
+        paymasterOptions.paymasterTokenAddress = paymasterTokenAddress
+      }
+    }
 
     const userOperation = await createUserOperation(this.protocolKit, transactions, {
       entryPoint: this.#ENTRYPOINT_ADDRESS,
-      paymasterOptions: this.#paymasterOptions,
-      amountToApprove,
+      paymasterOptions,
+      amountToApprove: isSponsored ? undefined : amountToApprove,
       customNonce
     })
 

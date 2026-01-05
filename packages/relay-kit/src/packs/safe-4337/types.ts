@@ -83,6 +83,8 @@ export type Safe4337CreateTransactionProps = {
     feeEstimator?: IFeeEstimator
     customNonce?: bigint
     paymasterTokenAddress?: string
+    isSponsored?: boolean
+    sponsorshipPolicyId?: string
   }
 }
 
