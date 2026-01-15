@@ -53,7 +53,8 @@ import {
   UserOperationWithPayload,
   PaymasterOptions,
   BundlerClient,
-  PimlicoTokenQuotesResponse
+  PimlicoTokenQuotesResponse,
+  DefaultPaymasterTokensResponse
 } from './types'
 import {
   ABI,
@@ -705,15 +706,17 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
   async getEstimateFee({
     safeOperation,
-    feeEstimator = new PimlicoFeeEstimator()
+    feeEstimator = new PimlicoFeeEstimator(),
+    paymasterOptions
   }: EstimateFeeProps): Promise<BaseSafeOperation> {
     const threshold = await this.protocolKit.getThreshold()
+    const options = paymasterOptions || this.#paymasterOptions
 
     const preEstimationData = await feeEstimator?.preEstimateUserOperationGas?.({
       bundlerUrl: this.#BUNDLER_URL,
       entryPoint: this.#ENTRYPOINT_ADDRESS,
       userOperation: safeOperation.getUserOperation(),
-      paymasterOptions: this.#paymasterOptions,
+      paymasterOptions: options,
       protocolKit: this.protocolKit
     })
 
@@ -733,6 +736,15 @@ export class Safe4337Pack extends RelayKitBasePack<{
     })
 
     if (estimateUserOperationGas) {
+      if (
+        feeEstimator.defaultVerificationGasLimitOverhead != null &&
+        estimateUserOperationGas.verificationGasLimit != null
+      ) {
+        estimateUserOperationGas.verificationGasLimit = (
+          BigInt(estimateUserOperationGas.verificationGasLimit) +
+          BigInt(threshold) * feeEstimator.defaultVerificationGasLimitOverhead
+        ).toString()
+      }
       safeOperation.addEstimations(estimateUserOperationGas)
     }
 
@@ -743,11 +755,25 @@ export class Safe4337Pack extends RelayKitBasePack<{
         ...safeOperation.getUserOperation(),
         signature: getDummySignature(this.#SAFE_WEBAUTHN_SHARED_SIGNER_ADDRESS, threshold)
       },
-      paymasterOptions: this.#paymasterOptions,
+      paymasterOptions: options,
       protocolKit: this.protocolKit
     })
 
     if (postEstimationData) {
+      // GenericFeeEstimator might add overhead in postEstimate, but we ensure it here if provided in data
+      if (
+        feeEstimator.defaultVerificationGasLimitOverhead != null &&
+        postEstimationData.verificationGasLimit != null
+      ) {
+        // Check if override already applied by checking if it matches estimation?
+        // Actually, GenericFeeEstimator applies it in postEstimate.
+        // But for safety, we can leave it to estimator or apply if missing.
+        // The previous code in tether_Safe4337Pack applied it here too.
+        postEstimationData.verificationGasLimit = (
+          BigInt(postEstimationData.verificationGasLimit) +
+          BigInt(threshold) * feeEstimator.defaultVerificationGasLimitOverhead
+        ).toString()
+      }
       safeOperation.addEstimations(postEstimationData)
     }
 
@@ -813,7 +839,8 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
     return await this.getEstimateFee({
       safeOperation,
-      feeEstimator
+      feeEstimator,
+      paymasterOptions
     })
   }
 
@@ -1040,19 +1067,51 @@ export class Safe4337Pack extends RelayKitBasePack<{
     return this.#bundlerClient.request({ method: RPC_4337_CALLS.CHAIN_ID })
   }
 
-  async getTokenExchangeRate(token: string): Promise<bigint> {
-    const response = (await this.#bundlerClient.request({
-      method: 'pimlico_getTokenQuotes',
-      params: [{ tokens: [token] }, this.#ENTRYPOINT_ADDRESS, `0x${this.#chainId.toString(16)}`]
-    })) as PimlicoTokenQuotesResponse
-
-    const quote = response.quotes.find((q) => q.token.toLowerCase() === token.toLowerCase())
-
-    if (!quote) {
-      throw new Error(`No quote found for token ${token}`)
+  /**
+   * Returns the exchange rate applied by the paymaster.
+   *
+   * @param {string} tokenAddress - The address of the token to get the exchange rate for.
+   * @returns {Promise<bigint>} - The exchange rate for the token used by the paymaster.
+   * @throws {Error} If paymaster URL is not configured or if the token is not supported
+   */
+  async getTokenExchangeRate(tokenAddress: string): Promise<bigint> {
+    if (!this.#paymasterOptions?.paymasterUrl) {
+      throw new Error('Paymaster URL is not configured')
     }
 
-    return BigInt(quote.exchangeRate)
+    const bundlerClient = createBundlerClient(this.#paymasterOptions?.paymasterUrl)
+    const isPimlico = this.#paymasterOptions.paymasterUrl.includes('pimlico')
+
+    if (isPimlico) {
+      const response = (await bundlerClient.request({
+        method: 'pimlico_getTokenQuotes',
+        params: [
+          {
+            tokens: [tokenAddress]
+          },
+          this.#ENTRYPOINT_ADDRESS,
+          `0x${this.#chainId.toString(16)}`
+        ]
+      })) as PimlicoTokenQuotesResponse
+
+      const quote = response.quotes[0]
+      return BigInt(quote.exchangeRate)
+    } else {
+      const response = (await bundlerClient.request({
+        method: 'pm_supportedERC20Tokens',
+        params: [this.#ENTRYPOINT_ADDRESS]
+      })) as DefaultPaymasterTokensResponse
+
+      const matchingToken = response.tokens.find(
+        (token) => token.address.toLowerCase() === tokenAddress.toLowerCase()
+      )
+
+      if (!matchingToken) {
+        throw new Error(`No exchange rate found for token: ${tokenAddress}`)
+      }
+
+      return BigInt(matchingToken.exchangeRate)
+    }
   }
 
   getOnchainIdentifier(): string {
