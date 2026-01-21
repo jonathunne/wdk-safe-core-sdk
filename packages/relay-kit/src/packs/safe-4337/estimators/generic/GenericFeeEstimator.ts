@@ -103,10 +103,28 @@ export class GenericFeeEstimator implements IFeeEstimator {
       throw new Error("Can't use GenericFeeEstimator if protocolKit is null.")
     }
 
+    const chainId = await protocolKit.getChainId()
+
     if (!paymasterOptions) return {}
 
+    // Bump callGasLimit by 50% if it exists, to cover execution variances (e.g. USDT cold storage)
+    // Only apply this fix for USDT transfers on Ethereum Mainnet
+    if (userOperation.callGasLimit && chainId === 1n) {
+      const USDT_MAINNET = '0xdac17f958d2ee523a2206206994597c13d831ec7'
+      // Safe 4337 Module callData structure: executeUserOp(to, value, data, operation)
+      // selector: 0x7bb37428 (4 bytes) -> chars 0-9
+      // arg1 (to): 32 bytes (64 chars) -> chars 10-73. The address is the last 40 chars: 34-73
+      const callData = userOperation.callData.toString().toLowerCase()
+      if (callData.startsWith('0x7bb37428')) {
+        const toAddress = '0x' + callData.slice(34, 74)
+        if (toAddress === USDT_MAINNET) {
+          const oldLimit = BigInt(userOperation.callGasLimit)
+          userOperation.callGasLimit = (oldLimit * 150n) / 100n
+        }
+      }
+    }
+
     const paymasterClient = createBundlerClient(paymasterOptions.paymasterUrl)
-    const chainId = await protocolKit.getChainId()
     if (paymasterOptions.isSponsored) {
       const params: [UserOperationStringValues, string, string, Record<string, unknown>?] = [
         userOperationToHexValues(userOperation, entryPoint),
