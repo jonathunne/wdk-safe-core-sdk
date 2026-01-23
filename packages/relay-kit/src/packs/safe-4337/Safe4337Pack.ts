@@ -1138,7 +1138,7 @@ export class Safe4337Pack extends RelayKitBasePack<{
     saltNonce,
     chainId,
     safeVersion = '1.4.1',
-    safeModulesVersion = '0.2.0',
+    safeModulesVersion = DEFAULT_SAFE_MODULES_VERSION,
     paymasterOptions
   }: {
     threshold: number
