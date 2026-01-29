@@ -1,7 +1,7 @@
 import { parseAbi } from 'viem'
 
 export const DEFAULT_SAFE_VERSION = '1.4.1'
-export const DEFAULT_SAFE_MODULES_VERSION = '0.2.0'
+export const DEFAULT_SAFE_MODULES_VERSION = '0.3.0'
 
 export const EIP712_SAFE_OPERATION_TYPE_V06 = {
   SafeOp: [
@@ -44,6 +44,7 @@ export const ABI = parseAbi([
   'function multiSend(bytes memory transactions) public payable',
   'function executeUserOp(address to, uint256 value, bytes data, uint8 operation)',
   'function approve(address _spender, uint256 _value)',
+  'function allowance(address _owner, address _spender) view returns (uint256)',
   'function configure((uint256 x, uint256 y, uint176 verifiers) signer)'
 ])
 

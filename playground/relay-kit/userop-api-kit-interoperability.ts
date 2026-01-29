@@ -1,6 +1,7 @@
+import * as dotenv from 'dotenv'
 import { privateKeyToAddress } from 'viem/accounts'
 import SafeApiKit from '@safe-global/api-kit'
-import { Safe4337Pack } from '@safe-global/relay-kit'
+import { Safe4337Pack } from '@wdk-safe-global/relay-kit'
 import { waitForOperationToFinish } from '../utils'
 
 // Variables
@@ -15,8 +16,15 @@ const RPC_URL = 'https://ethereum-sepolia-rpc.publicnode.com'
 const BUNDLER_URL = 'https://...'
 const PAYMASTER_URL = 'https://...'
 
+dotenv.config({ path: './playground/relay-kit/.env' })
+
+const { API_KEY } = process.env
+
 async function main() {
-  const apiKit = new SafeApiKit({ chainId: BigInt(CHAIN_ID) })
+  const apiKit = new SafeApiKit({
+    chainId: BigInt(CHAIN_ID),
+    apiKey: API_KEY || ''
+  })
 
   let safe4337Pack = await Safe4337Pack.init({
     provider: RPC_URL,

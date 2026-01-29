@@ -1,4 +1,4 @@
-import Safe from '@safe-global/protocol-kit'
+import Safe from '@wdk-safe-global/protocol-kit'
 import { encodeFunctionData, getAddress, Hex, hexToBytes, sliceHex, toHex } from 'viem'
 import {
   MetaTransactionData,
@@ -11,13 +11,15 @@ import {
   isEntryPointV6,
   isEntryPointV7,
   encodeMultiSendCallData
-} from '@safe-global/relay-kit/packs/safe-4337/utils'
-import { ABI } from '@safe-global/relay-kit/packs/safe-4337/constants'
+} from '@wdk-safe-global/relay-kit/packs/safe-4337/utils'
+import { ABI } from '@wdk-safe-global/relay-kit/packs/safe-4337/constants'
 import {
   ERC20PaymasterOption,
   PaymasterOptions,
   UserOperationStringValues
-} from '@safe-global/relay-kit/packs/safe-4337/types'
+} from '@wdk-safe-global/relay-kit/packs/safe-4337/types'
+
+const USDT_ON_MAINNET = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 
 /**
  * Encode the UserOperation execution from a transaction.
@@ -53,6 +55,22 @@ async function getCallData(
   amountToApprove?: bigint
 ): Promise<string> {
   if (amountToApprove) {
+    // Handle USDT on Mainnet special case - must reset allowance to 0 first
+    if (paymasterOptions.paymasterTokenAddress.toLowerCase() === USDT_ON_MAINNET.toLowerCase()) {
+      const resetApproveToPaymasterTransaction = {
+        to: paymasterOptions.paymasterTokenAddress,
+        data: encodeFunctionData({
+          abi: ABI,
+          functionName: 'approve',
+          args: [paymasterOptions.paymasterAddress, 0n]
+        }),
+        value: '0',
+        operation: OperationType.Call // Call for approve
+      }
+
+      transactions.push(resetApproveToPaymasterTransaction)
+    }
+
     const approveToPaymasterTransaction = {
       to: paymasterOptions.paymasterTokenAddress,
       data: encodeFunctionData({
@@ -145,9 +163,9 @@ export async function createUserOperation(
       nonce: nonce.toString(),
       initCode,
       callData,
-      callGasLimit: 1n,
-      verificationGasLimit: 1n,
-      preVerificationGas: 1n,
+      callGasLimit: 0n,
+      verificationGasLimit: 0n,
+      preVerificationGas: 0n,
       maxFeePerGas: 1n,
       maxPriorityFeePerGas: 1n,
       paymasterAndData,
@@ -160,9 +178,9 @@ export async function createUserOperation(
     nonce: nonce.toString(),
     ...unpackInitCode(initCode),
     callData,
-    callGasLimit: 1n,
-    verificationGasLimit: 1n,
-    preVerificationGas: 1n,
+    callGasLimit: 0n,
+    verificationGasLimit: 0n,
+    preVerificationGas: 0n,
     maxFeePerGas: 1n,
     maxPriorityFeePerGas: 1n,
     paymaster: paymasterAndData,

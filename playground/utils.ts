@@ -6,7 +6,7 @@ import {
   formatEther,
   parseAbi
 } from 'viem'
-import { Safe4337Pack } from '@safe-global/relay-kit'
+import { Safe4337Pack } from '@wdk-safe-global/relay-kit'
 import { ExternalSigner } from '@safe-global/protocol-kit'
 import { getBlock, waitForTransactionReceipt } from 'viem/actions'
 import { MetaTransactionData } from '@safe-global/types-kit'
@@ -27,7 +27,7 @@ export async function waitForOperationToFinish(
   chainName: string,
   safe4337Pack: Safe4337Pack
 ) {
-  console.log(`https://jiffyscan.xyz/userOpHash/${userOperationHash}?network=${chainName}`)
+  console.log(`https://v2.jiffyscan.xyz/userOpHash/${userOperationHash}?network=${chainName}`)
 
   let userOperationReceipt = null
   while (!userOperationReceipt) {
